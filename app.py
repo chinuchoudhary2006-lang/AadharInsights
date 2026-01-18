@@ -1,34 +1,55 @@
 import os
+from pathlib import Path
+
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
+import requests
 
-st.set_page_config(page_title="Aadhaar Hackathon Dashboard", page_icon="🪪", layout="wide")
+st.set_page_config(page_title="Aadhaar Dashboard", page_icon="🪪", layout="wide")
 
-# -----------------------------
-# Auto load local CSVs (no upload UI if found)
-# -----------------------------
+# ============================================================
+# 1) AUTO-DOWNLOAD DATA (Option B: judges don't upload)
+# ============================================================
+DATA_DIR = Path("data")
+DATA_DIR.mkdir(exist_ok=True)
+
+# 🔴 Replace with DIRECT download URLs (not Google Drive "view" links)
+URLS = {
+    "Enrollment.csv": "https://huggingface.co/datasets/ChinmayChoudhary/Aadharinsights/resolve/main/Enrollement.csv",
+    "Demographic.csv": "https://huggingface.co/datasets/ChinmayChoudhary/Aadharinsights/resolve/main/Demographic.csv",
+    "Biometrics.csv": "https://huggingface.co/datasets/ChinmayChoudhary/Aadharinsights/resolve/main/Biometrics.csv",
+}
+
+def download_file(url: str, dest: Path):
+    dest_tmp = dest.with_suffix(dest.suffix + ".tmp")
+    with requests.get(url, stream=True, timeout=600) as r:
+        r.raise_for_status()
+        with open(dest_tmp, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):  # 1 MB
+                if chunk:
+                    f.write(chunk)
+    dest_tmp.replace(dest)
+
 @st.cache_data(show_spinner=False)
-def load_data_auto():
-    candidates = {
-        "enr": ["Enrollement.csv", "Enrollment.csv", "enrollment.csv"],
-        "demo": ["Demographic.csv", "demographic.csv"],
-        "bio": ["Biometrics.csv", "biometrics.csv"],
-    }
+def ensure_data_files():
+    # Stop early if URLs not filled
+    if any(v.strip() == "PASTE_URL_HERE" for v in URLS.values()):
+        raise RuntimeError("Set direct dataset URLs in the URLS dict in app.py.")
 
-    def first_existing(lst):
-        for f in lst:
-            if os.path.exists(f):
-                return f
-        return None
+    for fname, url in URLS.items():
+        path = DATA_DIR / fname
+        if not path.exists():
+            st.info(f"Downloading {fname} (first time only)...")
+            download_file(url, path)
+    return True
 
-    enr_path = first_existing(candidates["enr"])
-    demo_path = first_existing(candidates["demo"])
-    bio_path = first_existing(candidates["bio"])
-
-    if not (enr_path and demo_path and bio_path):
-        return None, None, None, {"mode": "missing", "paths": (enr_path, demo_path, bio_path)}
+@st.cache_data(show_spinner=False)
+def load_data():
+    enr_path = DATA_DIR / "Enrollment.csv"
+    demo_path = DATA_DIR / "Demographic.csv"
+    bio_path = DATA_DIR / "Biometrics.csv"
 
     enrollment_df = pd.read_csv(enr_path)
     demographic_df = pd.read_csv(demo_path)
@@ -37,25 +58,11 @@ def load_data_auto():
     for df in (enrollment_df, demographic_df, biometrics_df):
         df.columns = df.columns.str.strip()
 
-    return enrollment_df, demographic_df, biometrics_df, {"mode": "local", "paths": (enr_path, demo_path, bio_path)}
+    return enrollment_df, demographic_df, biometrics_df, (str(enr_path), str(demo_path), str(bio_path))
 
-def read_uploaded_or_stop():
-    st.warning("Local CSVs not found. Upload once to run the dashboard.")
-    up_enr = st.file_uploader("Upload Enrollment/Enrollement CSV", type=["csv"])
-    up_demo = st.file_uploader("Upload Demographic CSV", type=["csv"])
-    up_bio = st.file_uploader("Upload Biometrics CSV", type=["csv"])
-
-    if not (up_enr and up_demo and up_bio):
-        st.stop()
-
-    enrollment_df = pd.read_csv(up_enr); enrollment_df.columns = enrollment_df.columns.str.strip()
-    demographic_df = pd.read_csv(up_demo); demographic_df.columns = demographic_df.columns.str.strip()
-    biometrics_df = pd.read_csv(up_bio); biometrics_df.columns = biometrics_df.columns.str.strip()
-    return enrollment_df, demographic_df, biometrics_df
-
-# -----------------------------
-# Cleaning
-# -----------------------------
+# ============================================================
+# 2) CLEANING
+# ============================================================
 def clean_common(df: pd.DataFrame, date_col="date", state_col="state"):
     out = df.copy()
     if date_col in out.columns:
@@ -90,9 +97,9 @@ def clean_biometrics(df):
         df["pincode"] = pd.to_numeric(df["pincode"], errors="coerce").astype("Int64")
     return df
 
-# -----------------------------
-# Filters
-# -----------------------------
+# ============================================================
+# 3) FILTERS
+# ============================================================
 def state_district_filter(df: pd.DataFrame, state_col: str, district_col: str, label_prefix: str):
     states = sorted(df[state_col].dropna().unique().tolist()) if state_col in df.columns else []
     state = st.sidebar.selectbox(f"{label_prefix} State", ["All"] + states, key=f"{label_prefix}_state")
@@ -126,29 +133,25 @@ def date_filter(df: pd.DataFrame, date_col="date", label="Date range", key="date
         return df[(df[date_col] >= start) & (df[date_col] <= end)]
     return df
 
-# -----------------------------
-# Render sections
-# -----------------------------
+# ============================================================
+# 4) RENDER SECTIONS
+# ============================================================
 def render_enrollment(enr_df):
     st.header("1) Enrollment")
-
     total = enr_df["total_enrolment"].fillna(0).sum() if "total_enrolment" in enr_df.columns else 0
     st.metric("Total Enrollment", f"{int(total):,}")
 
-    # Top 10 States
     if "state" in enr_df.columns and "total_enrolment" in enr_df.columns:
         st.subheader("Top 10 States (Enrollment)")
         s = (enr_df.groupby("state")["total_enrolment"].sum()
              .reset_index().sort_values("total_enrolment", ascending=False).head(10))
         st.plotly_chart(px.bar(s, x="state", y="total_enrolment"), use_container_width=True)
 
-    # Trend
     if "date" in enr_df.columns and "total_enrolment" in enr_df.columns:
         st.subheader("Trend")
         t = enr_df.groupby("date", dropna=False)["total_enrolment"].sum().reset_index().sort_values("date")
         st.plotly_chart(px.line(t, x="date", y="total_enrolment", markers=True), use_container_width=True)
 
-    # District leaderboard
     if "district" in enr_df.columns and "total_enrolment" in enr_df.columns:
         st.subheader("Top Districts (Enrollment)")
         d = (enr_df.groupby("district")["total_enrolment"].sum()
@@ -168,20 +171,17 @@ def render_demographic(demo_df):
     c1.metric("Total Demographic Enrolment", f"{int(total):,}")
     c2.metric("Fake flagged (sum)", f"{int(fake_sum):,}")
 
-    # Top 10 States
     if "state" in demo_df.columns and "total_enrolment" in demo_df.columns:
         st.subheader("Top 10 States (Demographic)")
         s = (demo_df.groupby("state")["total_enrolment"].sum()
              .reset_index().sort_values("total_enrolment", ascending=False).head(10))
         st.plotly_chart(px.bar(s, x="state", y="total_enrolment"), use_container_width=True)
 
-    # Trend
     if "date" in demo_df.columns and "total_enrolment" in demo_df.columns:
         st.subheader("Trend")
         t = demo_df.groupby("date", dropna=False)["total_enrolment"].sum().reset_index().sort_values("date")
         st.plotly_chart(px.line(t, x="date", y="total_enrolment", markers=True), use_container_width=True)
 
-    # District leaderboard
     if "district" in demo_df.columns and "total_enrolment" in demo_df.columns:
         st.subheader("Top Districts (Demographic)")
         d = (demo_df.groupby("district")["total_enrolment"].sum()
@@ -193,24 +193,20 @@ def render_demographic(demo_df):
 
 def render_biometrics(bio_df, district_col):
     st.header("3) Biometrics")
-
     total_bio = bio_df["total_bio"].fillna(0).sum() if "total_bio" in bio_df.columns else 0
     st.metric("Total Biometrics", f"{int(total_bio):,}")
 
-    # Top 10 States
     if "state" in bio_df.columns and "total_bio" in bio_df.columns:
         st.subheader("Top 10 States (Biometrics)")
         s = (bio_df.groupby("state")["total_bio"].sum()
              .reset_index().sort_values("total_bio", ascending=False).head(10))
         st.plotly_chart(px.bar(s, x="state", y="total_bio"), use_container_width=True)
 
-    # Trend
     if "date" in bio_df.columns and "total_bio" in bio_df.columns:
         st.subheader("Trend")
         t = bio_df.groupby("date", dropna=False)["total_bio"].sum().reset_index().sort_values("date")
         st.plotly_chart(px.line(t, x="date", y="total_bio", markers=True), use_container_width=True)
 
-    # District leaderboard
     if district_col in bio_df.columns and "total_bio" in bio_df.columns:
         st.subheader("Top Districts (Biometrics)")
         d = (bio_df.groupby(district_col)["total_bio"].sum()
@@ -224,7 +220,8 @@ def render_recommendations(enr_df, demo_df, bio_df):
     st.header("4) Recommendations")
     st.caption("Auto insights based on the selected filters in this section.")
 
-    join_cols = [c for c in ["date", "state", "pincode"] if c in enr_df.columns and c in demo_df.columns and c in bio_df.columns]
+    join_cols = [c for c in ["date", "state", "pincode"]
+                 if c in enr_df.columns and c in demo_df.columns and c in bio_df.columns]
     if not join_cols:
         st.info("Not enough common columns to combine for recommendations (need date/state/pincode).")
         return
@@ -234,17 +231,18 @@ def render_recommendations(enr_df, demo_df, bio_df):
     bio_agg = bio_df.groupby(join_cols, dropna=False)["total_bio"].sum().reset_index().rename(columns={"total_bio": "bio_total"})
 
     merged = enr_agg.merge(demo_agg, on=join_cols, how="outer").merge(bio_agg, on=join_cols, how="outer")
-    merged["bio_coverage"] = np.where(merged["enr_total"].fillna(0) > 0, merged["bio_total"].fillna(0) / merged["enr_total"].fillna(0), np.nan)
+    merged["bio_coverage"] = np.where(
+        merged["enr_total"].fillna(0) > 0,
+        merged["bio_total"].fillna(0) / merged["enr_total"].fillna(0),
+        np.nan
+    )
     merged["gap_demo_minus_enr"] = merged["demo_total"].fillna(0) - merged["enr_total"].fillna(0)
 
-    low_cov = merged.sort_values("bio_coverage", ascending=True).head(10)
-    high_gap = merged.sort_values("gap_demo_minus_enr", ascending=False).head(10)
-
     st.subheader("Top areas needing biometrics push (lowest bio coverage)")
-    st.dataframe(low_cov, use_container_width=True)
+    st.dataframe(merged.sort_values("bio_coverage", ascending=True).head(10), use_container_width=True)
 
     st.subheader("Top areas where Demographic > Enrollment gap is high")
-    st.dataframe(high_gap, use_container_width=True)
+    st.dataframe(merged.sort_values("gap_demo_minus_enr", ascending=False).head(10), use_container_width=True)
 
 def render_combined_insights(enr_df, demo_df, bio_df):
     st.header("5) Combined Insights")
@@ -254,7 +252,6 @@ def render_combined_insights(enr_df, demo_df, bio_df):
         st.info("Combined insights needs a shared 'date' column.")
         return
 
-    # Trend line
     enr_t = enr_df.groupby("date", dropna=False)["total_enrolment"].sum().reset_index().rename(columns={"total_enrolment": "Enrollment"})
     demo_t = demo_df.groupby("date", dropna=False)["total_enrolment"].sum().reset_index().rename(columns={"total_enrolment": "Demographic"})
     bio_t = bio_df.groupby("date", dropna=False)["total_bio"].sum().reset_index().rename(columns={"total_bio": "Biometrics"})
@@ -263,84 +260,19 @@ def render_combined_insights(enr_df, demo_df, bio_df):
     st.plotly_chart(px.line(trend, x="date", y=["Enrollment", "Demographic", "Biometrics"], markers=True),
                     use_container_width=True)
 
-    # Totals
-    total_enr = float(enr_df["total_enrolment"].fillna(0).sum()) if "total_enrolment" in enr_df.columns else 0.0
-    total_demo = float(demo_df["total_enrolment"].fillna(0).sum()) if "total_enrolment" in demo_df.columns else 0.0
-    total_bio = float(bio_df["total_bio"].fillna(0).sum()) if "total_bio" in bio_df.columns else 0.0
-    cov = (total_bio / total_enr) if total_enr else np.nan
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Total Enrollment", f"{int(total_enr):,}")
-    c2.metric("Total Demographic", f"{int(total_demo):,}")
-    c3.metric("Total Biometrics", f"{int(total_bio):,}")
-    st.metric("Overall Bio Coverage (bio/enrollment)", f"{cov:.2%}" if pd.notna(cov) else "—")
-
-    # Pie: totals composition
-    st.subheader("Pie: Overall Composition (Totals)")
-    share_df = pd.DataFrame({"Metric": ["Enrollment", "Demographic", "Biometrics"], "Total": [total_enr, total_demo, total_bio]})
-    st.plotly_chart(px.pie(share_df, names="Metric", values="Total"), use_container_width=True)
-
-    # Pies: age mix
-    st.subheader("Pie: Age Composition")
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-        st.markdown("**Enrollment age mix**")
-        if all(c in enr_df.columns for c in ["age_0_5", "age_5_17", "age_18_greater"]):
-            age_enr = pd.DataFrame({
-                "Age Bucket": ["0-5", "5-17", "18+"],
-                "Count": [
-                    float(enr_df["age_0_5"].fillna(0).sum()),
-                    float(enr_df["age_5_17"].fillna(0).sum()),
-                    float(enr_df["age_18_greater"].fillna(0).sum()),
-                ]
-            })
-            st.plotly_chart(px.pie(age_enr, names="Age Bucket", values="Count"), use_container_width=True)
-        else:
-            st.info("Enrollment age columns not found.")
-
-    with col2:
-        st.markdown("**Demographic age mix**")
-        if all(c in demo_df.columns for c in ["demo_age_5_17", "demo_age_17_"]):
-            age_demo = pd.DataFrame({
-                "Age Bucket": ["5-17", "17+"],
-                "Count": [
-                    float(demo_df["demo_age_5_17"].fillna(0).sum()),
-                    float(demo_df["demo_age_17_"].fillna(0).sum()),
-                ]
-            })
-            st.plotly_chart(px.pie(age_demo, names="Age Bucket", values="Count"), use_container_width=True)
-        else:
-            st.info("Demographic age columns not found.")
-
-    with col3:
-        st.markdown("**Biometrics age mix**")
-        if all(c in bio_df.columns for c in ["bio_age_5_17", "bio_age_17_"]):
-            age_bio = pd.DataFrame({
-                "Age Bucket": ["5-17", "17+"],
-                "Count": [
-                    float(bio_df["bio_age_5_17"].fillna(0).sum()),
-                    float(bio_df["bio_age_17_"].fillna(0).sum()),
-                ]
-            })
-            st.plotly_chart(px.pie(age_bio, names="Age Bucket", values="Count"), use_container_width=True)
-        else:
-            st.info("Biometrics age columns not found.")
-
-# -----------------------------
-# Main
-# -----------------------------
+# ============================================================
+# 5) MAIN
+# ============================================================
 st.title("🪪 Aadhaar Dashboard")
 
-enrollment_df, demographic_df, biometrics_df, meta = load_data_auto()
-if meta["mode"] == "missing":
-    enrollment_df, demographic_df, biometrics_df = read_uploaded_or_stop()
-else:
-    enr_path, demo_path, bio_path = meta["paths"]
-    st.caption(
-        f"Loaded local files ✅  Enrollment: {os.path.basename(enr_path)} | "
-        f"Demographic: {os.path.basename(demo_path)} | Biometrics: {os.path.basename(bio_path)}"
-    )
+try:
+    ensure_data_files()
+except Exception as e:
+    st.error(f"Dataset download failed: {e}")
+    st.stop()
+
+enrollment_df, demographic_df, biometrics_df, paths = load_data()
+st.caption(f"Loaded data ✅ Enrollment: {paths[0]} | Demographic: {paths[1]} | Biometrics: {paths[2]}")
 
 # Clean
 enrollment_df = clean_enrollment(enrollment_df)
@@ -349,7 +281,6 @@ biometrics_df = clean_biometrics(biometrics_df)
 
 bio_district_col = "district_norm" if "district_norm" in biometrics_df.columns else "district"
 
-# Sidebar navigation (5 sections)
 st.sidebar.title("Navigation")
 section = st.sidebar.radio(
     "Go to",
